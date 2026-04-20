@@ -249,9 +249,7 @@ export default function StrategyComparator() {
         
         // Calcul du capital empruntable sur la durée restante
         const creditRate = globalParams.creditRate || 0;
-        const isETF = strategy.type === "etf";
-
-        const debtCapacity = !isETF && maxLoanDurationYears > 0 && maxBankMonthlyPayment > 0
+        const debtCapacity = maxLoanDurationYears > 0 && maxBankMonthlyPayment > 0
           ? computeLoanCapacity(maxBankMonthlyPayment, creditRate, maxLoanDurationYears)
           : 0;
         
