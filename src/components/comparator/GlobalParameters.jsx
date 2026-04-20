@@ -9,6 +9,10 @@ const SCENARIOS = [
   { value: 'crash_start', label: 'Crash début (−30% an 1-2)' },
   { value: 'crash_end', label: 'Crash fin (−30% dernières années)' },
   { value: 'volatile', label: 'Volatile (±15% alternant)' },
+  { value: 'sideways', label: 'Cycle plat (hauts/bas, progression lente)' },
+  { value: 'dotcom_2008', label: 'Double crise (style 2000 + 2008)' },
+  { value: 'stochastic_mild', label: 'Aléatoire modéré (reproductible)' },
+  { value: 'stochastic_crisis', label: 'Aléatoire avec crises (reproductible)' },
 ];
 
 // Calcule l'effort mensuel net qui amène le paiement crédit SCPI exactement à 35% DTI
@@ -78,6 +82,14 @@ export default function GlobalParameters({ params, onChange }) {
             <span className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-muted-foreground">€/mois</span>
           </div>
         </div>
+        <div className="space-y-2">
+          <Label className="text-xs font-medium text-muted-foreground uppercase tracking-wider">Épargne bonus ETF</Label>
+          <div className="relative">
+            <Input type="number" value={params.etfBonusMonthlySavings || 0} onChange={(e) => update("etfBonusMonthlySavings", Number(e.target.value))} className="pr-16 font-mono text-sm" />
+            <span className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-muted-foreground">€/mois</span>
+          </div>
+          <p className="text-xs text-muted-foreground">Ajoutée uniquement aux versements ETF (ETF pur, SCPI, immobilier).</p>
+        </div>
 
         <div className="space-y-2">
           <Label className="text-xs font-medium text-muted-foreground uppercase tracking-wider">Taux crédit (toutes stratégies)</Label>
@@ -128,7 +140,7 @@ export default function GlobalParameters({ params, onChange }) {
         </div>
         <div className="space-y-2 col-span-full border-t border-border pt-4">
           <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-3">Profil emprunteur</p>
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-5">
+          <div className="grid grid-cols-1 sm:grid-cols-4 gap-5">
             <div className="space-y-2">
               <Label className="text-xs font-medium text-muted-foreground uppercase tracking-wider">Revenu annuel net imposable</Label>
               <div className="relative">
@@ -141,6 +153,13 @@ export default function GlobalParameters({ params, onChange }) {
               <div className="relative">
                 <Input type="number" value={params.currentMonthlyDebt} onChange={(e) => update("currentMonthlyDebt", Number(e.target.value))} className="pr-16 font-mono text-sm" />
                 <span className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-muted-foreground">€/mois</span>
+              </div>
+            </div>
+            <div className="space-y-2">
+              <Label className="text-xs font-medium text-muted-foreground uppercase tracking-wider">Âge actuel</Label>
+              <div className="relative">
+                <Input type="number" value={params.currentAge || 35} onChange={(e) => update("currentAge", Number(e.target.value))} className="pr-12 font-mono text-sm" />
+                <span className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-muted-foreground">ans</span>
               </div>
             </div>
             <div className="space-y-2">
@@ -222,6 +241,14 @@ export default function GlobalParameters({ params, onChange }) {
                   />
                   <span className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-muted-foreground">€</span>
                 </div>
+              </div>
+              <div className="sm:col-span-2 rounded-md border border-border bg-muted/20 px-3 py-2 text-xs text-muted-foreground space-y-1">
+                <p className="font-semibold text-foreground">Règles de financement appliquées</p>
+                <p>Priorité cash ({`capital disponible`}) puis vente ETF si nécessaire.</p>
+                <p>La plus-value latente ETF impacte aussi l'impôt estimé lors des ventes ETF (apport et grosse dépense).</p>
+                <p>ETF pur: vente ETF ponctuelle au mois choisi (impôt sur la part de plus-value vendue).</p>
+                <p>SCPI: la dépense déclenche une vente SCPI, remboursement anticipé du crédit (CRD + IRA standard), puis complément éventuel par vente ETF.</p>
+                <p>Après vente SCPI, les loyers cessent ; l'effort mensuel continue vers ETF.</p>
               </div>
             </div>
           )}

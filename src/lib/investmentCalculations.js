@@ -12,6 +12,16 @@ function monthlyRateFromAnnualForETF(annualRate, rateConvention = 'effective') {
   return rateConvention === 'nominal' ? annualRate / 12 : monthlyRate(annualRate);
 }
 
+function seededRandom(seed) {
+  let t = seed >>> 0;
+  return () => {
+    t += 0x6D2B79F5;
+    let r = Math.imul(t ^ (t >>> 15), 1 | t);
+    r ^= r + Math.imul(r ^ (r >>> 7), 61 | r);
+    return ((r ^ (r >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
 // PMT formula (monthly payment for a loan)
 function pmt(rate, nper, pv) {
   if (rate === 0) return pv / nper;
@@ -69,6 +79,38 @@ function generateMonthlyReturns(annualReturn, months, scenario = 'linear', rateC
   } else if (scenario === 'volatile') {
     const amp = Math.abs(annualReturn) * 1.5;
     yearlyReturns = Array.from({ length: years }, (_, y) => annualReturn + (y % 2 === 0 ? amp : -amp));
+  } else if (scenario === 'sideways') {
+    yearlyReturns = Array.from({ length: years }, (_, y) => {
+      const cycle = y % 6;
+      if (cycle === 0) return -0.08;
+      if (cycle === 1) return 0.12;
+      if (cycle === 2) return -0.04;
+      if (cycle === 3) return 0.10;
+      if (cycle === 4) return -0.02;
+      return annualReturn;
+    });
+  } else if (scenario === 'dotcom_2008') {
+    yearlyReturns = Array.from({ length: years }, (_, y) => {
+      if (y === 1) return -0.22;
+      if (y === 2) return -0.16;
+      if (y === 8) return -0.38;
+      if (y === 9) return 0.19;
+      if (y === 10) return 0.14;
+      return annualReturn;
+    });
+  } else if (scenario === 'stochastic_mild' || scenario === 'stochastic_crisis') {
+    const rand = seededRandom(scenario === 'stochastic_mild' ? 20260420 : 20260421);
+    const drift = annualReturn;
+    const vol = scenario === 'stochastic_mild' ? 0.12 : 0.20;
+    const crashProb = scenario === 'stochastic_mild' ? 0.03 : 0.08;
+    yearlyReturns = Array.from({ length: years }, () => {
+      const u = rand();
+      const v = rand();
+      const z = Math.sqrt(-2 * Math.log(Math.max(u, 1e-9))) * Math.cos(2 * Math.PI * v);
+      const normalLike = drift + z * vol;
+      if (rand() < crashProb) return Math.max(-0.45, normalLike - 0.20);
+      return Math.max(-0.45, Math.min(0.45, normalLike));
+    });
   } else {
     yearlyReturns = Array(years).fill(annualReturn);
   }
@@ -91,6 +133,52 @@ export function computeEffectiveETFCapital(downPayment, capitalInitial, capitalD
   // To get `fromETF` net: gross = fromETF / (1 - gainRate * taxRate)
   const grossToSell = gainRate > 0 ? fromETF / (1 - gainRate * taxRate) : fromETF;
   return Math.max(0, capitalInitial - grossToSell);
+}
+
+export function computeRemainingCashAfterDownPayment(downPayment, capitalDisponible) {
+  const dp = downPayment || 0;
+  const cash = capitalDisponible || 0;
+  return Math.max(cash - Math.min(dp, cash), 0);
+}
+
+function computeEarlyRepaymentPenalty(crd, annualCreditRate, remainingPaymentsCount) {
+  if (crd <= 0 || remainingPaymentsCount <= 0) return 0;
+  // Indemnite standard (France): min(6 mois d'interets, 3% du capital rembourse).
+  const sixMonthsInterest = crd * annualCreditRate * 0.5;
+  const legalCap = crd * 0.03;
+  return Math.min(sixMonthsInterest, legalCap);
+}
+
+function computeIrrMonthly(cashflows, maxIterations = 100, tolerance = 1e-7) {
+  if (!cashflows || cashflows.length < 2) return null;
+  const hasPositive = cashflows.some((v) => v > 0);
+  const hasNegative = cashflows.some((v) => v < 0);
+  if (!hasPositive || !hasNegative) return null;
+
+  let rate = 0.005;
+  for (let i = 0; i < maxIterations; i++) {
+    let npv = 0;
+    let dNpv = 0;
+    for (let t = 0; t < cashflows.length; t++) {
+      const denom = Math.pow(1 + rate, t);
+      npv += cashflows[t] / denom;
+      if (t > 0) {
+        dNpv += (-t * cashflows[t]) / (denom * (1 + rate));
+      }
+    }
+    if (Math.abs(npv) < tolerance) return rate;
+    if (Math.abs(dNpv) < 1e-12) break;
+    const nextRate = rate - npv / dNpv;
+    if (!isFinite(nextRate) || nextRate <= -0.9999 || nextRate > 10) break;
+    rate = nextRate;
+  }
+  return null;
+}
+
+export function computeIRRAnnual(cashflows) {
+  const monthlyIrr = computeIrrMonthly(cashflows);
+  if (monthlyIrr == null) return null;
+  return Math.pow(1 + monthlyIrr, 12) - 1;
 }
 
 // Exported helper for UI display
@@ -145,6 +233,9 @@ export function computeRealEstateCapacity({
  */
 export function calculateETF({
   capitalInitial, initialCapital, monthlyContribution, annualReturn, taxRate, durationYears,
+  etfBonusMonthlySavings = 0,
+  availableCash = 0,
+  initialETFGainRate = 0,
   enableMajorExpense = false, majorExpenseYears, majorExpenseAmount = 0,
   etfScenario = 'linear', etfRateConvention = 'effective'
 }) {
@@ -157,27 +248,44 @@ export function calculateETF({
   const results = [];
 
   let capital = startCapital;
-  let totalInvested = startCapital;
+  const initialCostBasis = Math.max(startCapital * (1 - (initialETFGainRate || 0)), 0);
+  let totalInvested = initialCostBasis;
+  let cashReserve = availableCash;
 
   for (let m = 1; m <= months; m++) {
     const mr = monthlyReturns[m - 1];
-    capital = (capital + monthlyContribution) * (1 + mr);
-    totalInvested += monthlyContribution;
+    const monthlyETFContribution = monthlyContribution + etfBonusMonthlySavings;
+    capital = (capital + monthlyETFContribution) * (1 + mr);
+    totalInvested += monthlyETFContribution;
 
     let majorExpenseTaxPaid = 0;
     let majorExpenseNetPaid = 0;
+    let majorExpenseFromCash = 0;
+    let majorExpenseUnfunded = 0;
     if (majorExpenseMonth && m === majorExpenseMonth && majorExpenseAmount > 0) {
-      const sale = sellETFForNetAmount(capital, totalInvested, majorExpenseAmount, taxRate);
-      capital = sale.etfCapital;
-      totalInvested = sale.etfTotalInvested;
-      majorExpenseTaxPaid = sale.taxPaid;
-      majorExpenseNetPaid = sale.netRaised;
+      let remainingNeed = majorExpenseAmount;
+      const fromCash = Math.min(cashReserve, remainingNeed);
+      if (fromCash > 0) {
+        cashReserve = Math.max(cashReserve - fromCash, 0);
+        remainingNeed -= fromCash;
+        majorExpenseFromCash = fromCash;
+        majorExpenseNetPaid += fromCash;
+      }
+      if (remainingNeed > 0) {
+        const sale = sellETFForNetAmount(capital, totalInvested, remainingNeed, taxRate);
+        capital = sale.etfCapital;
+        totalInvested = sale.etfTotalInvested;
+        majorExpenseTaxPaid = sale.taxPaid;
+        majorExpenseNetPaid += sale.netRaised;
+        remainingNeed = Math.max(remainingNeed - sale.netRaised, 0);
+      }
+      majorExpenseUnfunded = remainingNeed;
     }
 
     const isLastMonth = m === months;
     const gain = Math.max(capital - totalInvested, 0);
     const tax = isLastMonth ? gain * taxRate : 0;
-    const netValue = capital - tax;
+    const netValue = capital - tax + cashReserve - majorExpenseUnfunded;
 
     results.push({
       month: m,
@@ -188,6 +296,9 @@ export function calculateETF({
       tax,
       majorExpenseTaxPaid,
       majorExpenseNetPaid,
+      majorExpenseFromCash,
+      majorExpenseUnfunded,
+      cashReserve,
       netValue,
     });
   }
@@ -204,6 +315,7 @@ export function calculateSCPILeverage({
   taxRateETF,
   durationYears,
   monthlySavings,
+  etfBonusMonthlySavings = 0,
   creditRate,
   creditDurationYears,
   scpiEntryFees,
@@ -214,6 +326,8 @@ export function calculateSCPILeverage({
   scpiTaxOnRent,
   scpiPaymentFrequency,
   scpiDownPayment,
+  availableCash = 0,
+  initialETFGainRate = 0,
   enableMajorExpense = false,
   majorExpenseYears,
   majorExpenseAmount = 0,
@@ -238,10 +352,14 @@ export function calculateSCPILeverage({
 
   const results = [];
   let etfCapital = etfInitCapital;
-  let etfTotalInvested = etfInitCapital;
+  const etfInitialCostBasis = Math.max(etfInitCapital * (1 - (initialETFGainRate || 0)), 0);
+  let etfTotalInvested = etfInitialCostBasis;
   let etfCashflowInvested = 0;
   let etfReinvestedFromSCPISale = 0;
-  let cashReserve = 0;
+  let cashReserve = availableCash;
+  let initialCashReserve = availableCash;
+  let cumulativeCreditInterestPaid = 0;
+  let cumulativeCreditPrincipalPaid = 0;
   let scpiValue = scpiCostBasis;
   // Apply occupancy rate stress to effective yield
   let annualRentBrut = scpiPrice * scpiInitialYield * scpiOccupancyRate;
@@ -281,6 +399,7 @@ export function calculateSCPILeverage({
       // Après extinction du prêt, l'épargne mensuelle redevient disponible en plus des loyers
       monthlyContributionETF = monthlySavings + monthlyRentNet;
     }
+    monthlyContributionETF += etfBonusMonthlySavings;
 
     etfCapital = (etfCapital + monthlyContributionETF) * (1 + etfMr);
     etfTotalInvested += monthlyContributionETF;
@@ -293,6 +412,8 @@ export function calculateSCPILeverage({
     let remainingBuybackAfterETF = 0;
     let remainingPaymentsCount = 0;
     let creditBuybackCost = 0;
+    let creditBuybackPenalty = 0;
+    let creditBuybackPrincipal = 0;
     let creditBuybackCoveredBySCPI = 0;
     let creditBuybackCoveredByETF = 0;
     let scpiEquity = scpiActive ? (scpiValue - crd) : 0;
@@ -311,9 +432,10 @@ export function calculateSCPILeverage({
       const liquidationNetSCPI = liquidationValue - scpiCapGainsTaxAmount;
 
       remainingPaymentsCount = m < creditMonths ? (creditMonths - m) : 0;
-      // Un rachat anticipe le capital restant dû (pas la somme des mensualités futures).
-      // Les intérêts futurs ne sont pas dus en cas de remboursement anticipé.
-      creditBuybackCost = crd;
+      creditBuybackPrincipal = crd;
+      creditBuybackPenalty = computeEarlyRepaymentPenalty(crd, creditRate, remainingPaymentsCount);
+      // Un rachat anticipe le capital restant du + IRA plafonnee.
+      creditBuybackCost = creditBuybackPrincipal + creditBuybackPenalty;
       creditBuybackCoveredBySCPI = Math.min(liquidationNetSCPI, creditBuybackCost);
       let remainingAfterSCPI = Math.max(creditBuybackCost - creditBuybackCoveredBySCPI, 0);
 
@@ -356,6 +478,8 @@ export function calculateSCPILeverage({
       interest = crd * creditMonthlyRate;
       principalPaid = monthlyPayment - interest;
       crd = Math.max(crd - principalPaid, 0);
+      cumulativeCreditInterestPaid += interest;
+      cumulativeCreditPrincipalPaid += principalPaid;
     } else if (scpiActive && m > creditMonths) {
       crd = 0;
     }
@@ -366,8 +490,10 @@ export function calculateSCPILeverage({
       const scpiGainFinal = Math.max(liquidationValue - scpiCostBasis, 0);
       scpiCapGainsTaxAmount = scpiGainFinal * scpiCapitalGainsTax;
       remainingPaymentsCount = m < creditMonths ? (creditMonths - m) : 0;
-      // À l'horizon de projection, on valorise la dette par le CRD.
-      creditBuybackCost = crd;
+      creditBuybackPrincipal = crd;
+      creditBuybackPenalty = computeEarlyRepaymentPenalty(crd, creditRate, remainingPaymentsCount);
+      // A l'horizon, on valorise la sortie avec CRD + IRA plafonnee.
+      creditBuybackCost = creditBuybackPrincipal + creditBuybackPenalty;
       const liquidationNetSCPI = liquidationValue - scpiCapGainsTaxAmount;
       creditBuybackCoveredBySCPI = Math.min(liquidationNetSCPI, creditBuybackCost);
       remainingBuybackAfterETF = Math.max(creditBuybackCost - creditBuybackCoveredBySCPI, 0);
@@ -376,14 +502,28 @@ export function calculateSCPILeverage({
 
     let majorExpenseNetPaid = 0;
     let majorExpenseTaxPaid = 0;
+    let majorExpenseFromCash = 0;
+    let majorExpenseFromInitialCash = 0;
+    let majorExpenseFromSCPISaleCash = 0;
     let majorExpenseUnfunded = 0;
     if (majorExpenseMonth && m === majorExpenseMonth && majorExpenseAmount > 0) {
       let remainingNeed = majorExpenseAmount;
-      const fromCash = Math.min(cashReserve, remainingNeed);
-      if (fromCash > 0) {
-        cashReserve = Math.max(cashReserve - fromCash, 0);
-        remainingNeed -= fromCash;
-        majorExpenseNetPaid += fromCash;
+      const fromInitialCash = Math.min(initialCashReserve, remainingNeed);
+      if (fromInitialCash > 0) {
+        initialCashReserve = Math.max(initialCashReserve - fromInitialCash, 0);
+        cashReserve = Math.max(cashReserve - fromInitialCash, 0);
+        remainingNeed -= fromInitialCash;
+        majorExpenseFromInitialCash = fromInitialCash;
+        majorExpenseFromCash += fromInitialCash;
+        majorExpenseNetPaid += fromInitialCash;
+      }
+      const fromSCPISaleCash = Math.min(cashReserve, remainingNeed);
+      if (fromSCPISaleCash > 0) {
+        cashReserve = Math.max(cashReserve - fromSCPISaleCash, 0);
+        remainingNeed -= fromSCPISaleCash;
+        majorExpenseFromSCPISaleCash = fromSCPISaleCash;
+        majorExpenseFromCash += fromSCPISaleCash;
+        majorExpenseNetPaid += fromSCPISaleCash;
       }
       if (remainingNeed > 0) {
         const sale = sellETFForNetAmount(etfCapital, etfTotalInvested, remainingNeed, taxRateETF);
@@ -415,6 +555,8 @@ export function calculateSCPILeverage({
       crd,
       loanAmount,
       creditBuybackCost,
+      creditBuybackPrincipal,
+      creditBuybackPenalty,
       creditBuybackCoveredBySCPI,
       creditBuybackCoveredByETF,
       remainingPaymentsCount,
@@ -433,11 +575,18 @@ export function calculateSCPILeverage({
       etfTotalInvested,
       majorExpenseTaxPaid,
       majorExpenseNetPaid,
+      majorExpenseFromCash,
+      majorExpenseFromInitialCash,
+      majorExpenseFromSCPISaleCash,
       majorExpenseUnfunded,
       cashReserve,
+      liquidationValue,
+      scpiCapGainsTaxAmount,
       monthlyPayment: (scpiActive && m <= creditMonths && loanAmount > 0) ? monthlyPayment : 0,
       monthlyContributionETF,
       rentReceived,
+      cumulativeCreditInterestPaid,
+      cumulativeCreditPrincipalPaid,
       netValue: totalNet,
     });
   }
@@ -454,6 +603,7 @@ export function calculateRealEstate({
   taxRateETF,
   durationYears,
   monthlySavings,
+  etfBonusMonthlySavings = 0,
   creditRate,
   creditDurationYears,
   propertyPrice,
@@ -469,6 +619,8 @@ export function calculateRealEstate({
   taxOnRent,
   propertyCapitalGainsTax = 0,
   surplusAllocation = 'etf',
+  availableCash = 0,
+  initialETFGainRate = 0,
   enableMajorExpense = false,
   majorExpenseYears,
   majorExpenseAmount = 0,
@@ -489,7 +641,9 @@ export function calculateRealEstate({
 
   const results = [];
   let etfCapital = etfStart;
-  let etfTotalInvested = etfStart;
+  const etfInitialCostBasis = Math.max(etfStart * (1 - (initialETFGainRate || 0)), 0);
+  let etfTotalInvested = etfInitialCostBasis;
+  let cashReserve = availableCash;
   let propertyValue = propertyPrice;
   let currentMonthlyRentBase = propertyPrice * rentalYield / 12;
   let crd = loanAmount;
@@ -531,18 +685,33 @@ export function calculateRealEstate({
       // Surplus + loyer net vers ETF
       monthlyContributionETF = surplus + netRent;
     }
+    monthlyContributionETF += etfBonusMonthlySavings;
 
     etfCapital = (etfCapital + monthlyContributionETF) * (1 + etfMr);
     etfTotalInvested += monthlyContributionETF;
 
     let majorExpenseTaxPaid = 0;
     let majorExpenseNetPaid = 0;
+    let majorExpenseFromCash = 0;
+    let majorExpenseUnfunded = 0;
     if (majorExpenseMonth && m === majorExpenseMonth && majorExpenseAmount > 0) {
-      const sale = sellETFForNetAmount(etfCapital, etfTotalInvested, majorExpenseAmount, taxRateETF);
-      etfCapital = sale.etfCapital;
-      etfTotalInvested = sale.etfTotalInvested;
-      majorExpenseTaxPaid = sale.taxPaid;
-      majorExpenseNetPaid = sale.netRaised;
+      let remainingNeed = majorExpenseAmount;
+      const fromCash = Math.min(cashReserve, remainingNeed);
+      if (fromCash > 0) {
+        cashReserve = Math.max(cashReserve - fromCash, 0);
+        remainingNeed -= fromCash;
+        majorExpenseFromCash = fromCash;
+        majorExpenseNetPaid += fromCash;
+      }
+      if (remainingNeed > 0) {
+        const sale = sellETFForNetAmount(etfCapital, etfTotalInvested, remainingNeed, taxRateETF);
+        etfCapital = sale.etfCapital;
+        etfTotalInvested = sale.etfTotalInvested;
+        majorExpenseTaxPaid = sale.taxPaid;
+        majorExpenseNetPaid += sale.netRaised;
+        remainingNeed = Math.max(remainingNeed - sale.netRaised, 0);
+      }
+      majorExpenseUnfunded = remainingNeed;
     }
 
     const isLastMonth = m === months;
@@ -554,7 +723,7 @@ export function calculateRealEstate({
     const propGain = isLastMonth ? Math.max(propertyValue - propertyPrice, 0) : 0;
     const propCapGainsTax = propGain * propertyCapitalGainsTax;
     const propertyEquity = propertyValue - propCapGainsTax - crd;
-    const totalNet = etfNet + propertyEquity;
+    const totalNet = etfNet + propertyEquity + cashReserve - majorExpenseUnfunded;
 
     results.push({
       month: m,
@@ -569,6 +738,9 @@ export function calculateRealEstate({
       netRent,
       majorExpenseTaxPaid,
       majorExpenseNetPaid,
+      majorExpenseFromCash,
+      majorExpenseUnfunded,
+      cashReserve,
       netValue: totalNet,
     });
   }
